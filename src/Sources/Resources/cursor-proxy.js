@@ -23,6 +23,7 @@ function parsePositiveInt(value, fallback) {
 const CONFIG = Object.freeze({
     pollTimeoutMs: parsePositiveInt(process.env.CURSOR_POLL_TIMEOUT_MS, 15000),
     upstreamTimeoutMs: parsePositiveInt(process.env.CURSOR_UPSTREAM_TIMEOUT_MS, 60000),
+    maxBodyBytes: parsePositiveInt(process.env.CURSOR_MAX_BODY_BYTES, 10 * 1024 * 1024), // 10 MB
 });
 
 // ─────────────────────────────────────────────
@@ -803,11 +804,31 @@ function collectCursorResponse(cursorRes) {
     });
 }
 
+function readBoundedBody(req, res, callback) {
+    let body = '';
+    let bytes = 0;
+    req.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > CONFIG.maxBodyBytes) {
+            req.destroy();
+            if (!res.headersSent) {
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Request body too large' }));
+            }
+            return;
+        }
+        body += chunk;
+    });
+    req.on('end', () => {
+        if (bytes <= CONFIG.maxBodyBytes) {
+            callback(body);
+        }
+    });
+}
+
 // Handle OpenAI chat completions by translating to Cursor protocol
 async function handleOpenAIChatCompletion(req, res, token, checksum, version) {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
+    readBoundedBody(req, res, async (body) => {
         try {
             const parsedBody = parseJsonObjectOrError(body);
             if (!parsedBody.ok) {
@@ -890,9 +911,7 @@ async function handleOpenAIChatCompletion(req, res, token, checksum, version) {
 }
 
 function handleOpenAIResponses(req, res, token, checksum, version) {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
+    readBoundedBody(req, res, async (body) => {
         let model = 'cursor-grok';
         let stream = false;
         let messages = [];

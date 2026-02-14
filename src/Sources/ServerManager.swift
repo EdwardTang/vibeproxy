@@ -109,6 +109,8 @@ class ServerManager: ObservableObject {
         static let gracefulTerminationTimeout: TimeInterval = 2.0
         static let terminationPollInterval: TimeInterval = 0.05
         static let cursorProxyRestartDelay: TimeInterval = 1.0
+        /// Process must survive this long before restart counter resets
+        static let cursorProxyHealthyThreshold: TimeInterval = 5.0
     }
     
     private enum RetryLimits {
@@ -284,7 +286,12 @@ class ServerManager: ObservableObject {
         do {
             try process.run()
             cursorProcess = process
-            cursorProxyRestartAttempts = 0
+            // Only reset restart counter after sustained healthy period to prevent
+            // unbounded restart loops when the process crashes immediately on start.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Timing.cursorProxyHealthyThreshold) { [weak self] in
+                guard let self = self, self.cursorProcess === process, process.isRunning else { return }
+                self.cursorProxyRestartAttempts = 0
+            }
             addLog("✓ Cursor Proxy started on port 8319 (\(nodeExecutable))")
         } catch {
             addLog("❌ Failed to start Cursor Proxy: \(error.localizedDescription)")

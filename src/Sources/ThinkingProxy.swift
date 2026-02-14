@@ -34,6 +34,10 @@ class ThinkingProxy {
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
+
+    /// When non-nil, all incoming requests must include `X-Proxy-Auth: <token>`.
+    /// Set this before exposing the proxy via a public tunnel.
+    var tunnelAuthToken: String?
     
     private enum Config {
         static let hardTokenCap = 32000
@@ -233,6 +237,16 @@ class ThinkingProxy {
         
         let bodyStart = requestString.distance(from: requestString.startIndex, to: bodyStartRange.upperBound)
         let bodyString = String(requestString[requestString.index(requestString.startIndex, offsetBy: bodyStart)...])
+        
+        // Enforce tunnel auth when a token is configured
+        if let requiredToken = tunnelAuthToken {
+            let providedToken = headers.first { $0.0.lowercased() == "x-proxy-auth" }?.1
+            if providedToken != requiredToken {
+                NSLog("[ThinkingProxy] Auth rejected: missing or invalid X-Proxy-Auth header")
+                sendError(to: connection, statusCode: 401, message: "Unauthorized")
+                return
+            }
+        }
         
         // Route Cursor (Pro) API traffic to the Cursor proxy (adds auth + checksum, then forwards to api2.cursor.sh)
         let hostHeader = headers.first { $0.0.lowercased() == "host" }?.1 ?? ""
