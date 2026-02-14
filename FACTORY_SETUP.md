@@ -58,8 +58,13 @@ Once VibeProxy is running:
    - Enter your Z.AI API key (get one at [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list))
    - This provides access to **GLM-4.7** and other GLM models
    - VibeProxy will securely store your API key
+8. **(Optional)** Click **"Connect"** next to Cursor (Pro)
+   - Enter your **Cursor Session Token** (from `auth-personal.json`)
+   - VibeProxy handles the complex machine-ID authentication and checksums
+   - This provides access to **all Cursor Pro** models including `claude-3.5-sonnet`, `gpt-4o`, and `cursor-small`
+   - The Cursor proxy runs on port **8319**
 
-✅ The server starts automatically and runs on port **8317**
+✅ The main server runs on **8317**, and the Cursor proxy runs on **8319**
 
 ## Step 3: Configure Factory CLI
 
@@ -295,6 +300,41 @@ Edit your Factory configuration file at `~/.factory/config.json` (if the file do
       "base_url": "http://localhost:8317/v1",
       "api_key": "dummy-not-used",
       "provider": "openai"
+    },
+    {
+      "model_display_name": "Cursor: Opus 4.6 (Thinking)",
+      "model": "claude-4.6-opus-high-thinking",
+      "base_url": "http://localhost:8319/v1",
+      "api_key": "dummy-cursor-token",
+      "provider": "openai"
+    },
+    {
+      "model_display_name": "Cursor: Sonnet 4.5",
+      "model": "claude-4-5-sonnet-20250929",
+      "base_url": "http://localhost:8319/v1",
+      "api_key": "dummy-cursor-token",
+      "provider": "openai"
+    },
+    {
+      "model_display_name": "Cursor: GPT-5.2 Codex",
+      "model": "gpt-5.2-codex-high",
+      "base_url": "http://localhost:8319/v1",
+      "api_key": "dummy-cursor-token",
+      "provider": "openai"
+    },
+    {
+      "model_display_name": "Cursor: Composer 1.5",
+      "model": "composer-1.5",
+      "base_url": "http://localhost:8319/v1",
+      "api_key": "dummy-cursor-token",
+      "provider": "openai"
+    },
+    {
+      "model_display_name": "Cursor: Grok Code",
+      "model": "grok-code-fast-1",
+      "base_url": "http://localhost:8319/v1",
+      "api_key": "dummy-cursor-token",
+      "provider": "openai"
     }
   ]
 }
@@ -314,6 +354,7 @@ Edit your Factory configuration file at `~/.factory/config.json` (if the file do
    Then choose from:
    - `claude-opus-4-5` (Claude Opus 4.5 - Most powerful)
    - `claude-sonnet-4-5` (Claude 4.5 Sonnet)
+   - `claude-4.6-opus-high`, `gpt-5.2-codex-high` (Cursor Pro)
    - `gpt-5.1`, `gpt-5.1-codex`, etc.
    - `gemini-3-pro-preview`, `gemini-3-pro-image-preview`, `gemini-2.5-pro`, etc.
 
@@ -374,6 +415,21 @@ Antigravity provides access to Claude models with a generous usage quota (shared
 
 > [!NOTE]
 > Z.AI GLM models require an API key instead of OAuth authentication. Get your API key at [z.ai/manage-apikey/apikey-list](https://z.ai/manage-apikey/apikey-list) and add it in VibeProxy Settings → Z.AI GLM → Add Account.
+
+### Cursor Models
+
+Cursor models require an active **Cursor Pro** subscription. Usage counts against your Cursor quota (fast/slow request pools). VibeProxy automatically handles the `machineId` and checksum headers required by Cursor.
+
+#### Recommended Models
+- `claude-4.6-opus-high-thinking` - Claude 4.6 Opus (Thinking mode, Default)
+- `claude-4.5-sonnet-thinking` - Claude 4.5 Sonnet (Thinking mode)
+- `gpt-5.3-codex` - GPT-5.3 Codex (Latest)
+- `composer-1.5` - Composer 1.5 (Default)
+- `grok-code-fast-1` - Grok Code
+- `gemini-3-pro` - Gemini 3 Pro
+
+> [!TIP]
+> **See [CURSOR_PRO_MODELS.md](./CURSOR_PRO_MODELS.md)** for a complete mapping of all 50+ internal model slugs, effort levels (`-high`, `-max`), and technical architecture insights.
 
 ### OpenAI Models
 

@@ -154,6 +154,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
         menu.addItem(NSMenuItem.separator())
 
+        // Launch CLIs with proxy (Option 2: external launcher)
+        let droidItem = NSMenuItem(title: "Run Factory-Droid CLI in Terminal", action: #selector(launchDroidCLI), keyEquivalent: "")
+        droidItem.tag = 103
+        droidItem.toolTip = "Opens Terminal with HTTP_PROXY/HTTPS_PROXY set to this server and runs: droid"
+        droidItem.isEnabled = false
+        menu.addItem(droidItem)
+
+        let ampItem = NSMenuItem(title: "Run AMP Code CLI in Terminal", action: #selector(launchAMPCLI), keyEquivalent: "")
+        ampItem.tag = 104
+        ampItem.toolTip = "Opens Terminal with HTTP_PROXY/HTTPS_PROXY set to this server and runs: amp"
+        ampItem.isEnabled = false
+        menu.addItem(ampItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Check for Updates
         let checkForUpdatesItem = NSMenuItem(title: "Check for Updates...", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)), keyEquivalent: "u")
         checkForUpdatesItem.target = updaterController
@@ -195,7 +210,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         settingsWindow = window
     }
     
-    func windowDidClose(_ notification: Notification) {
+    private func windowDidClose(_ notification: Notification) {
         if notification.object as? NSWindow === settingsWindow {
             settingsWindow = nil
         }
@@ -271,6 +286,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         showNotification(title: "Copied", body: "Server URL copied to clipboard")
     }
 
+    /// Opens Terminal and runs the given CLI command with HTTP_PROXY/HTTPS_PROXY set to this server
+    private func launchCLIInTerminal(cliCommand: String, name: String) {
+        let port = thinkingProxy.proxyPort
+        let proxyURL = "http://127.0.0.1:\(port)"
+        let shellScript = "export HTTP_PROXY=\(proxyURL); export HTTPS_PROXY=\(proxyURL); \(cliCommand)"
+        let escaped = shellScript.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let osaScript = "tell application \"Terminal\" to do script \"\(escaped)\""
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", osaScript]
+        do {
+            try process.run()
+            showNotification(title: "Terminal opened", body: "\(name) is running with proxy \(proxyURL)")
+        } catch {
+            NSLog("[AppDelegate] Failed to launch Terminal for \(name): %@", error.localizedDescription)
+            showNotification(title: "Launch failed", body: "Could not open Terminal: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func launchDroidCLI() {
+        launchCLIInTerminal(cliCommand: "droid", name: "Factory-Droid CLI")
+    }
+
+    @objc func launchAMPCLI() {
+        launchCLIInTerminal(cliCommand: "amp", name: "AMP Code CLI")
+    }
+
     @objc func updateMenuBarStatus() {
         // Update status items
         if let serverStatus = menu.item(at: 0) {
@@ -284,6 +326,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
 
         if let copyURLItem = menu.item(withTag: 102) {
             copyURLItem.isEnabled = serverManager.isRunning
+        }
+        if let droidItem = menu.item(withTag: 103) {
+            droidItem.isEnabled = serverManager.isRunning
+        }
+        if let ampItem = menu.item(withTag: 104) {
+            ampItem.isEnabled = serverManager.isRunning
         }
 
         // Update icon based on server status

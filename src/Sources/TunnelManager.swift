@@ -5,6 +5,9 @@ class TunnelManager {
     private var process: Process?
     private(set) var isRunning = false
     private(set) var publicURL: String?
+    /// Auth token generated per tunnel session. Callers should set this on
+    /// ThinkingProxy.tunnelAuthToken so remote requests are gated.
+    private(set) var authToken: String?
     private let urlFoundLock = NSLock()
     
     func start(port: Int, completion: @escaping (Bool, String?) -> Void) {
@@ -12,6 +15,9 @@ class TunnelManager {
             completion(true, publicURL)
             return
         }
+        
+        // Generate a fresh auth token for this tunnel session
+        authToken = UUID().uuidString
         
         // Check if cloudflared is installed
         let cloudflaredPaths = [
@@ -126,6 +132,7 @@ class TunnelManager {
             DispatchQueue.main.async {
                 self?.isRunning = false
                 self?.publicURL = nil
+                self?.authToken = nil
                 NotificationCenter.default.post(name: .serverStatusChanged, object: nil)
             }
         }
@@ -152,6 +159,7 @@ class TunnelManager {
         process = nil
         isRunning = false
         publicURL = nil
+        authToken = nil
         
         NotificationCenter.default.post(name: .serverStatusChanged, object: nil)
     }

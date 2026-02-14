@@ -94,6 +94,11 @@ When you click "Connect":
 
 ## Development
 
+### Rapid Iteration
+
+For the Cursor canary smoke-test workflow (`composer-1.5`) and fast local loop commands (`make smoke`, `make rapid`), see `AGENTS.md`.
+Also follow global AI lint doctrine at `~/.cursor/.ai-lint/INDEX.md` for implementation/review standards.
+
 ### Project Structure
 
 ```

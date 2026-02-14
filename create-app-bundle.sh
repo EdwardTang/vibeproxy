@@ -17,6 +17,15 @@ BUNDLE_ID="com.cliproxyapi.menubar"
 BUILD_DIR="$SRC_DIR/.build/release"
 APP_DIR="$PROJECT_DIR/$APP_NAME.app"
 
+# If existing app is locked (e.g. code-signed), use a dev name so we can still build and run
+if [ -d "$APP_DIR" ]; then
+  if ! rm -rf "$APP_DIR" 2>/dev/null; then
+    APP_DIR="$PROJECT_DIR/VibeProxy-dev.app"
+    echo -e "${YELLOW}Existing VibeProxy.app is locked; creating VibeProxy-dev.app instead${NC}"
+    rm -rf "$APP_DIR" 2>/dev/null || true
+  fi
+fi
+
 # Build the Swift executable first
 echo -e "${BLUE}Building Swift executable (release)...${NC}"
 cd "$SRC_DIR"
