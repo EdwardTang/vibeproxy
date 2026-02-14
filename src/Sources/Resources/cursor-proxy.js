@@ -15,6 +15,16 @@ const TARGET_PORT = 443;
 // Match Cursor.app so api2.cursor.sh treats all proxied requests (Droid CLI, AMP, etc.) as IDE requests
 const CLIENT_VERSION = '2.5.8';  // fallback; can be overridden by reading Cursor.app product.json
 
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const CONFIG = Object.freeze({
+    pollTimeoutMs: parsePositiveInt(process.env.CURSOR_POLL_TIMEOUT_MS, 15000),
+    upstreamTimeoutMs: parsePositiveInt(process.env.CURSOR_UPSTREAM_TIMEOUT_MS, 60000),
+});
+
 // ─────────────────────────────────────────────
 //  Minimal Protobuf Codec (no external deps)
 // ─────────────────────────────────────────────
@@ -179,6 +189,65 @@ function decodeConnectFrameData(frame) {
     return payload;
 }
 
+function parseConnectTrailerError(decodedTrailer) {
+    const text = decodedTrailer.toString('utf8').trim();
+    if (!text) return null;
+    try {
+        const parsed = JSON.parse(text);
+        const err = parsed.error ?? parsed.connectError ?? parsed.message;
+        if (typeof err === 'string' && err) return err;
+        if (err && typeof err === 'object') {
+            if (typeof err.message === 'string' && err.message) return err.message;
+            return JSON.stringify(err);
+        }
+        if (typeof parsed.code === 'number' && parsed.code !== 0) return text;
+        return null;
+    } catch (_) {
+        const lower = text.toLowerCase();
+        if (lower.includes('error') || (lower.includes('grpc-status:') && !lower.includes('grpc-status: 0'))) {
+            return text;
+        }
+        return null;
+    }
+}
+
+function parseJsonObjectOrError(bodyText) {
+    let parsed;
+    try {
+        parsed = JSON.parse(bodyText);
+    } catch (_) {
+        return { ok: false, error: 'Invalid JSON body' };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { ok: false, error: 'JSON body must be an object' };
+    }
+    return { ok: true, value: parsed };
+}
+
+function normalizeMessagesOrError(rawMessages) {
+    if (!Array.isArray(rawMessages)) {
+        return { ok: false, error: 'messages must be an array' };
+    }
+    const messages = [];
+    for (let i = 0; i < rawMessages.length; i += 1) {
+        const msg = rawMessages[i];
+        if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+            return { ok: false, error: `messages[${i}] must be an object` };
+        }
+        const role = typeof msg.role === 'string' && msg.role.trim() ? msg.role : 'user';
+        if (!Object.prototype.hasOwnProperty.call(msg, 'content')) {
+            return { ok: false, error: `messages[${i}].content is required` };
+        }
+        const content = msg.content;
+        const validContent = typeof content === 'string' || (content && typeof content === 'object');
+        if (!validContent) {
+            return { ok: false, error: `messages[${i}].content must be string/object/array` };
+        }
+        messages.push({ role, content });
+    }
+    return { ok: true, messages };
+}
+
 // Get Cursor token from request or fallback to file-based auth
 function getCursorToken(req) {
     // First try to get from Authorization header (Factory-Droid CLI sends API key here)
@@ -288,9 +357,6 @@ function generateCursorChecksum(machineId) {
     return encoded + machineId;
 }
 
-// Cache for machine ID (fetched once at startup)
-let cachedMachineId = null;
-
 const server = http.createServer((req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -380,30 +446,31 @@ const server = http.createServer((req, res) => {
             res.writeHead(proxyRes.statusCode, proxyRes.headers);
             proxyRes.pipe(res);
         });
+        proxy.setTimeout(CONFIG.upstreamTimeoutMs, () => {
+            proxy.destroy(new Error(`upstream timeout after ${CONFIG.upstreamTimeoutMs}ms`));
+        });
 
         proxy.on('error', (err) => {
             console.error('Proxy error:', err.message);
             console.error('Proxy error code:', err.code);
-            res.writeHead(502, { 'Content-Type': 'text/plain' });
-            res.end(`Bad Gateway: ${err.message}`);
+            if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end(`Bad Gateway: ${err.message}`);
+            } else {
+                res.destroy(err);
+            }
         });
 
         req.pipe(proxy);
     };
 
-    // Use cached machine ID or fetch it
-    if (cachedMachineId) {
-        handleRequest(cachedMachineId);
-    } else {
-        getMachineId(token, (machineId) => {
-            if (!machineId) {
-                console.error('Failed to get machine ID, using fallback');
-                machineId = generateMachineIdFallback(token);
-            }
-            cachedMachineId = machineId;
-            handleRequest(machineId);
-        });
-    }
+    getMachineId(token, (machineId) => {
+        if (!machineId) {
+            console.error('Failed to get machine ID, using fallback');
+            machineId = generateMachineIdFallback(token);
+        }
+        handleRequest(machineId);
+    });
 });
 
 // ─────────────────────────────────────────────
@@ -607,10 +674,9 @@ async function cursorChatWithToolsPoll(messages, model, token, checksum, version
         };
 
         // Default timeout: keep CLI responsive; Cursor can stream longer, but we can re-poll.
-        const timeoutMs = Number(process.env.CURSOR_POLL_TIMEOUT_MS || '15000');
         const timer = setTimeout(() => {
             finish({ ok: false, error: 'poll_timeout', fullText });
-        }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000);
+        }, CONFIG.pollTimeoutMs);
 
         pollRes.on('data', (chunk) => {
             buf = Buffer.concat([buf, chunk]);
@@ -623,10 +689,10 @@ async function cursorChatWithToolsPoll(messages, model, token, checksum, version
 
                 if (frame.flags & 0x02) {
                     // Trailer is JSON (sometimes gzipped).
-                    const trailerStr = decoded.toString('utf8');
-                    if (trailerStr.includes('\"error\"')) trailerError = trailerStr;
+                    trailerError = parseConnectTrailerError(decoded);
                     // Trailer typically means the stream is over; don't wait on socket close.
-                    finish({ ok: false, error: trailerError || trailerStr, fullText });
+                    if (trailerError) finish({ ok: false, error: trailerError, fullText });
+                    else finish({ ok: true, fullText });
                     return;
                 }
 
@@ -743,8 +809,20 @@ async function handleOpenAIChatCompletion(req, res, token, checksum, version) {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
         try {
-            const openAIRequest = JSON.parse(body);
-            const messages = openAIRequest.messages || [];
+            const parsedBody = parseJsonObjectOrError(body);
+            if (!parsedBody.ok) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: parsedBody.error }));
+                return;
+            }
+            const openAIRequest = parsedBody.value;
+            const normalized = normalizeMessagesOrError(openAIRequest.messages ?? []);
+            if (!normalized.ok) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: normalized.error }));
+                return;
+            }
+            const messages = normalized.messages;
             const model = openAIRequest.model || 'gpt-4';
             const wantsStream = openAIRequest.stream === true;
 
@@ -819,15 +897,27 @@ function handleOpenAIResponses(req, res, token, checksum, version) {
         let stream = false;
         let messages = [];
         try {
-            const parsed = JSON.parse(body || '{}');
+            const parsedBody = parseJsonObjectOrError(body || '{}');
+            if (!parsedBody.ok) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: parsedBody.error }));
+                return;
+            }
+            const parsed = parsedBody.value;
             if (parsed.model) model = parsed.model;
             stream = parsed.stream === true;
             // Convert /responses input to messages array for Cursor
             if (typeof parsed.input === 'string') {
                 messages = [{ role: 'user', content: parsed.input }];
             } else if (Array.isArray(parsed.input)) {
-                messages = parsed.input.map(m => ({
-                    role: m.role || 'user',
+                const normalized = normalizeMessagesOrError(parsed.input);
+                if (!normalized.ok) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: normalized.error }));
+                    return;
+                }
+                messages = normalized.messages.map(m => ({
+                    role: m.role,
                     content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
                 }));
             }
