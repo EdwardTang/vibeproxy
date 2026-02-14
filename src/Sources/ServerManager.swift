@@ -46,6 +46,9 @@ private struct RingBuffer<Element> {
 
 class ServerManager: ObservableObject {
     private var process: Process?
+    private var cursorProcess: Process?
+    private var cursorProxyRestartAttempts = 0
+    private var cursorProxyRestartWorkItem: DispatchWorkItem?
     @Published private(set) var isRunning = false
     private(set) var port = 8317
 
@@ -79,10 +82,37 @@ class ServerManager: ObservableObject {
     private let maxLogLines = 1000
     private let processQueue = DispatchQueue(label: "io.automaze.vibeproxy.server-process", qos: .userInitiated)
     
+    // Generic log handler for any process
+    private func setupProcessLogging(_ process: Process, name: String) {
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                self?.addLog("[\(name)] \(output)")
+            }
+        }
+        
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                self?.addLog("[\(name)] ⚠️ \(output)")
+            }
+        }
+    }
+    
     private enum Timing {
         static let readinessCheckDelay: TimeInterval = 1.0
         static let gracefulTerminationTimeout: TimeInterval = 2.0
         static let terminationPollInterval: TimeInterval = 0.05
+        static let cursorProxyRestartDelay: TimeInterval = 1.0
+    }
+    
+    private enum RetryLimits {
+        static let cursorProxyMaxRestarts = 3
     }
     
     var onLogUpdate: (([String]) -> Void)?
@@ -202,6 +232,7 @@ class ServerManager: ObservableObject {
                 self.isRunning = true
             }
             addLog("✓ Server started on port \(port)")
+            startCursorProxy()
             
             // Wait a bit to ensure it started successfully
             DispatchQueue.main.asyncAfter(deadline: .now() + Timing.readinessCheckDelay) { [weak self] in
@@ -220,7 +251,110 @@ class ServerManager: ObservableObject {
         }
     }
     
+
+    private func startCursorProxy() {
+        guard cursorProcess == nil else { return }
+        
+        guard let resourcePath = Bundle.main.resourcePath else { return }
+        // Look for the script in Resources or subdirectories
+        let scriptPath = (resourcePath as NSString).appendingPathComponent("cursor-proxy.js")
+        
+        guard FileManager.default.fileExists(atPath: scriptPath) else {
+             addLog("⚠️ cursor-proxy.js not found at \(scriptPath)")
+             return
+        }
+        
+        let process = Process()
+        let (nodeExecutable, nodeArgs) = resolveNodeInvocation(scriptPath: scriptPath)
+        process.executableURL = URL(fileURLWithPath: nodeExecutable)
+        process.arguments = nodeArgs
+        process.currentDirectoryURL = URL(fileURLWithPath: resourcePath, isDirectory: true)
+        process.environment = resolvedNodeEnvironment()
+        
+        setupProcessLogging(process, name: "CursorProxy")
+        
+        process.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                self?.cursorProcess = nil
+                self?.addLog("[CursorProxy] Stopped (code: \(proc.terminationStatus))")
+                self?.scheduleCursorProxyRestartIfNeeded(exitCode: proc.terminationStatus)
+            }
+        }
+        
+        do {
+            try process.run()
+            cursorProcess = process
+            cursorProxyRestartAttempts = 0
+            addLog("✓ Cursor Proxy started on port 8319 (\(nodeExecutable))")
+        } catch {
+            addLog("❌ Failed to start Cursor Proxy: \(error.localizedDescription)")
+            scheduleCursorProxyRestartIfNeeded(exitCode: -1)
+        }
+    }
+
+    private func resolveNodeInvocation(scriptPath: String) -> (String, [String]) {
+        // GUI apps on macOS often have a minimal PATH, so prefer common absolute node paths first.
+        let candidates = [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node"
+        ]
+
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return (path, [scriptPath])
+        }
+
+        // Fallback to env-based lookup for custom setups.
+        return ("/usr/bin/env", ["node", scriptPath])
+    }
+
+    private func stopCursorProxy() {
+        cursorProxyRestartWorkItem?.cancel()
+        cursorProxyRestartWorkItem = nil
+        cursorProxyRestartAttempts = 0
+        guard let process = cursorProcess else { return }
+        process.terminate()
+        cursorProcess = nil
+    }
+    
+    private func scheduleCursorProxyRestartIfNeeded(exitCode: Int32) {
+        guard isRunning else { return }
+        guard exitCode != 0 else { return }
+        guard cursorProcess == nil else { return }
+        
+        if cursorProxyRestartAttempts >= RetryLimits.cursorProxyMaxRestarts {
+            addLog("❌ Cursor Proxy failed after \(RetryLimits.cursorProxyMaxRestarts) restart attempts")
+            return
+        }
+        
+        cursorProxyRestartAttempts += 1
+        let attempt = cursorProxyRestartAttempts
+        addLog("⚠️ Cursor Proxy exited unexpectedly; restart attempt \(attempt)/\(RetryLimits.cursorProxyMaxRestarts)")
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            guard self.isRunning && self.cursorProcess == nil else { return }
+            self.startCursorProxy()
+        }
+        cursorProxyRestartWorkItem?.cancel()
+        cursorProxyRestartWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Timing.cursorProxyRestartDelay, execute: workItem)
+    }
+    
+    private func resolvedNodeEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let existingPath = env["PATH"] ?? ""
+        let requiredPrefixes = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let combined = (requiredPrefixes + [existingPath])
+            .filter { !$0.isEmpty }
+            .joined(separator: ":")
+        env["PATH"] = combined
+        return env
+    }
+    
     func stop(completion: (() -> Void)? = nil) {
+        stopCursorProxy()
+        
         guard let process = process else {
             DispatchQueue.main.async {
                 self.isRunning = false
@@ -517,6 +651,48 @@ class ServerManager: ObservableObject {
         }
     }
     
+    /// Saves a Cursor session token to the auth directory
+    func saveCursorToken(_ sessionToken: String, completion: @escaping (Bool, String) -> Void) {
+        let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
+        
+        // Create auth directory if needed
+        do {
+            try FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
+        } catch {
+            completion(false, "Failed to create auth directory: \(error.localizedDescription)")
+            return
+        }
+        
+        // Generate unique filename
+        let tokenPreview = String(sessionToken.prefix(8)) + "..." + String(sessionToken.suffix(4))
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filename = "cursor-\(UUID().uuidString.prefix(8)).json"
+        let filePath = authDir.appendingPathComponent(filename)
+        
+        // Create auth JSON
+        let authData: [String: Any] = [
+            "type": "cursor",
+            "email": tokenPreview,
+            "api_key": sessionToken,
+            "created": timestamp
+        ]
+        
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: authData, options: .prettyPrinted)
+            try jsonData.write(to: filePath)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: filePath.path)
+            addLog("✓ Cursor token saved to \(filename)")
+            
+            // Restart cursor proxy if running
+            stopCursorProxy()
+            startCursorProxy()
+            
+            completion(true, "Cursor token saved successfully")
+        } catch {
+            completion(false, "Failed to save Cursor token: \(error.localizedDescription)")
+        }
+    }
+    
     /// Returns the config path to use, merging bundled config with Z.AI provider and provider exclusions
     func getConfigPath() -> String {
         guard let resourcePath = Bundle.main.resourcePath else {
@@ -661,6 +837,28 @@ openai-compatibility:
                     addLog("✓ Cleaned up orphaned processes")
                 }
             }
+            
+            // Also cleanup orphaned node cursor-proxy processes
+            let checkNodeTask = Process()
+            checkNodeTask.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            checkNodeTask.arguments = ["-f", "cursor-proxy.js"]
+            
+            let nodeOutputPipe = Pipe()
+            checkNodeTask.standardOutput = nodeOutputPipe
+            checkNodeTask.standardError = Pipe()
+            
+            try checkNodeTask.run()
+            checkNodeTask.waitUntilExit()
+            
+            if checkNodeTask.terminationStatus == 0 {
+                let killNodeTask = Process()
+                killNodeTask.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+                killNodeTask.arguments = ["-9", "-f", "cursor-proxy.js"]
+                try killNodeTask.run()
+                killNodeTask.waitUntilExit()
+                addLog("✓ Cleaned up orphaned Cursor proxy processes")
+            }
+            
             // Exit code 1 means no processes found - this is fine, no need to log
         } catch {
             // Silently fail - this is not critical

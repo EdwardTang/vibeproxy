@@ -242,6 +242,8 @@ struct SettingsView: View {
     @State private var qwenEmail = ""
     @State private var showingZaiApiKeyPrompt = false
     @State private var zaiApiKey = ""
+    @State private var showingCursorTokenPrompt = false
+    @State private var cursorSessionToken = ""
     @State private var pendingRefresh: DispatchWorkItem?
     @State private var expandedRowCount = 0
     
@@ -385,6 +387,20 @@ struct SettingsView: View {
                     ) { EmptyView() }
 
                     ServiceRow(
+                        serviceType: .cursor,
+                        iconName: "icon-cursor.png", // Ensure this icon exists or use a generic one
+                        accounts: authManager.accounts(for: .cursor),
+                        isAuthenticating: authenticatingService == .cursor,
+                        helpText: "Cursor connects via your session token. Find it in your browser cookies for api2.cursor.sh.",
+                        isEnabled: serverManager.isProviderEnabled("cursor"),
+                        customTitle: nil,
+                        onConnect: { showingCursorTokenPrompt = true },
+                        onDisconnect: { account in disconnectAccount(account) },
+                        onToggleEnabled: { enabled in serverManager.setProviderEnabled("cursor", enabled: enabled) },
+                        onExpandChange: { expanded in expandedRowCount += expanded ? 1 : -1 }
+                    ) { EmptyView() }
+
+                    ServiceRow(
                         serviceType: .zai,
                         iconName: "icon-zai.png",
                         accounts: authManager.accounts(for: .zai),
@@ -503,6 +519,33 @@ struct SettingsView: View {
             }
             .padding(24)
             .frame(width: 400)
+            .frame(width: 400)
+        }
+        .sheet(isPresented: $showingCursorTokenPrompt) {
+            VStack(spacing: 16) {
+                Text("Cursor Session Token")
+                    .font(.headline)
+                Text("Enter your WorkosCursorSessionToken from browser cookies")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("session_...", text: $cursorSessionToken)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 300)
+                HStack(spacing: 12) {
+                    Button("Cancel") {
+                        showingCursorTokenPrompt = false
+                        cursorSessionToken = ""
+                    }
+                    Button("Add Token") {
+                        showingCursorTokenPrompt = false
+                        startCursorAuth(token: cursorSessionToken)
+                    }
+                    .disabled(cursorSessionToken.isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(24)
+            .frame(width: 400)
         }
         .onAppear {
             authManager.checkAuthStatus()
@@ -563,6 +606,9 @@ struct SettingsView: View {
         case .zai:
             authenticatingService = nil
             return // handled separately with API key prompt
+        case .cursor:
+            authenticatingService = nil
+            return // handled separately with token prompt
         }
         
         serverManager.runAuthCommand(command) { success, output in
@@ -604,6 +650,8 @@ struct SettingsView: View {
             return "🌐 Browser opened for Antigravity authentication.\n\nPlease complete the login in your browser."
         case .zai:
             return "✓ Z.AI API key added successfully.\n\nYou can now use GLM models through the proxy."
+        case .cursor:
+            return "✓ Cursor token added successfully.\n\nYou can now use Cursor models through the proxy."
         }
     }
     
@@ -648,6 +696,43 @@ struct SettingsView: View {
                 } else {
                     self.authResultSuccess = false
                     self.authResultMessage = "Failed to save API key.\n\nDetails: \(output.isEmpty ? "Unknown error" : output)"
+                    self.showingAuthResult = true
+                }
+            }
+        }
+    }
+    
+    private func startCursorAuth(token: String) {
+        authenticatingService = .cursor
+        var authToken = token
+        
+        // Check if input looks like JSON
+        if authToken.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"),
+           let data = authToken.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let accessToken = json["accessToken"] as? String {
+            authToken = accessToken
+        }
+        
+        // aggressively remove any newlines or spaces that might have been introduced by copy-pasting
+        authToken = authToken.components(separatedBy: .whitespacesAndNewlines).joined()
+        
+        NSLog("[SettingsView] Adding Cursor session token")
+        
+        serverManager.saveCursorToken(authToken) { success, output in
+            NSLog("[SettingsView] Cursor token save completed - success: %d, output: %@", success, output)
+            DispatchQueue.main.async {
+                self.authenticatingService = nil
+                self.cursorSessionToken = ""
+                
+                if success {
+                    self.authResultSuccess = true
+                    self.authResultMessage = self.successMessage(for: .cursor)
+                    self.showingAuthResult = true
+                    self.authManager.checkAuthStatus()
+                } else {
+                    self.authResultSuccess = false
+                    self.authResultMessage = "Failed to save Cursor token.\n\nDetails: \(output.isEmpty ? "Unknown error" : output)"
                     self.showingAuthResult = true
                 }
             }

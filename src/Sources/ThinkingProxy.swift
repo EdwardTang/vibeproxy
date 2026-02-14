@@ -27,6 +27,9 @@ class ThinkingProxy {
     let proxyPort: UInt16 = 8317
     private let targetPort: UInt16 = 8318
     private let targetHost = "127.0.0.1"
+    /// Port for the Cursor (Pro) proxy that adds auth and checksum for api2.cursor.sh
+    private let cursorProxyPort: UInt16 = 8319
+    private let cursorApiHost = "api2.cursor.sh"
     private(set) var isRunning = false
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
 
@@ -231,6 +234,14 @@ class ThinkingProxy {
         let bodyStart = requestString.distance(from: requestString.startIndex, to: bodyStartRange.upperBound)
         let bodyString = String(requestString[requestString.index(requestString.startIndex, offsetBy: bodyStart)...])
         
+        // Route Cursor (Pro) API traffic to the Cursor proxy (adds auth + checksum, then forwards to api2.cursor.sh)
+        let hostHeader = headers.first { $0.0.lowercased() == "host" }?.1 ?? ""
+        if hostHeader.lowercased() == cursorApiHost {
+            NSLog("[ThinkingProxy] Cursor API request detected, forwarding to Cursor proxy (port %d)", cursorProxyPort)
+            forwardToCursorProxy(method: method, path: path, version: httpVersion, headers: headers, body: bodyString, originalConnection: connection)
+            return
+        }
+        
         // Redirect Amp CLI login directly to ampcode.com to preserve auth state cookies
         if path.starts(with: "/auth/cli-login") || path.starts(with: "/api/auth/cli-login") {
             let loginPath = path.hasPrefix("/api/") ? String(path.dropFirst(4)) : path
@@ -278,6 +289,18 @@ class ThinkingProxy {
         }
         
         forwardRequest(method: method, path: rewrittenPath, version: httpVersion, headers: headers, body: modifiedBody, thinkingEnabled: thinkingEnabled, originalConnection: connection)
+    }
+    
+    /// If path is an absolute URL (e.g. https://api.example.com/v1/chat), returns (pathOnly, host); otherwise (path, nil) and caller uses header Host
+    private func parseAbsoluteRequestURL(_ path: String) -> (pathOnly: String, host: String?)? {
+        guard path.hasPrefix("https://") || path.hasPrefix("http://") else { return nil }
+        guard let schemeEnd = path.range(of: "://"),
+              let firstSlash = path[schemeEnd.upperBound...].firstIndex(of: "/") else { return nil }
+        let authority = String(path[schemeEnd.upperBound..<firstSlash])
+        let pathOnly = String(path[firstSlash...])
+        let host: String? = authority.contains(":") ? String(authority.split(separator: ":").first ?? "") : authority
+        guard let h = host, !h.isEmpty else { return nil }
+        return (pathOnly, h)
     }
     
     private func isClaudeModelRequest(body: String) -> Bool {
@@ -626,6 +649,58 @@ class ThinkingProxy {
         targetConnection.start(queue: .global(qos: .userInitiated))
     }
     
+    /**
+     Forwards Cursor (Pro) API requests to the Cursor proxy on port 8319.
+     The Node proxy adds authorization, x-cursor-checksum, and other required headers, then forwards to api2.cursor.sh.
+     */
+    private func forwardToCursorProxy(method: String, path: String, version: String, headers: [(String, String)], body: String, originalConnection: NWConnection) {
+        guard let port = NWEndpoint.Port(rawValue: cursorProxyPort) else {
+            NSLog("[ThinkingProxy] Invalid Cursor proxy port: %d", cursorProxyPort)
+            sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+            return
+        }
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: port)
+        let parameters = NWParameters.tcp
+        let targetConnection = NWConnection(to: endpoint, using: parameters)
+        
+        targetConnection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                var forwardedRequest = "\(method) \(path) \(version)\r\n"
+                let excludedHeaders: Set<String> = ["content-length", "host", "transfer-encoding"]
+                for (name, value) in headers {
+                    if excludedHeaders.contains(name.lowercased()) { continue }
+                    forwardedRequest += "\(name): \(value)\r\n"
+                }
+                forwardedRequest += "Host: \(self.cursorApiHost)\r\n"
+                forwardedRequest += "Connection: close\r\n"
+                forwardedRequest += "Content-Length: \(body.utf8.count)\r\n"
+                forwardedRequest += "\r\n"
+                forwardedRequest += body
+                
+                if let requestData = forwardedRequest.data(using: .utf8) {
+                    targetConnection.send(content: requestData, completion: .contentProcessed { error in
+                        if let error = error {
+                            NSLog("[ThinkingProxy] Cursor proxy send error: \(error)")
+                            targetConnection.cancel()
+                            originalConnection.cancel()
+                        } else {
+                            self.receiveResponse(from: targetConnection, originalConnection: originalConnection)
+                        }
+                    })
+                }
+            case .failed(let error):
+                NSLog("[ThinkingProxy] Cursor proxy connection failed: \(error)")
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Cursor proxy unreachable (is it running on port \(self.cursorProxyPort)?)")
+                targetConnection.cancel()
+            default:
+                break
+            }
+        }
+        targetConnection.start(queue: .global(qos: .userInitiated))
+    }
+    
     private enum BetaHeaders {
         static let interleavedThinking = "interleaved-thinking-2025-05-14"
     }
@@ -644,16 +719,30 @@ class ThinkingProxy {
         let parameters = NWParameters.tcp
         let targetConnection = NWConnection(to: endpoint, using: parameters)
         
+        // When client uses proxy, path may be absolute (https://api.example.com/v1/...); extract host so backend can route
+        let (pathToSend, effectiveHost) = parseAbsoluteRequestURL(path) ?? (path, nil)
+        
         targetConnection.stateUpdateHandler = { state in
             switch state {
             case .ready:
                 // Build the forwarded request
-                var forwardedRequest = "\(method) \(path) \(version)\r\n"
-                let excludedHeaders: Set<String> = ["content-length", "host", "transfer-encoding"]
+                var forwardedRequest = "\(method) \(pathToSend) \(version)\r\n"
+                // Preserve Host so cli-proxy-api can route by provider (Codex, etc.); only exclude content-length and transfer-encoding
+                let excludedHeaders: Set<String> = ["content-length", "transfer-encoding"]
                 var existingBetaHeader: String? = nil
+                var hasHost = false
                 
                 for (name, value) in headers {
                     let lowercasedName = name.lowercased()
+                    if lowercasedName == "host" {
+                        hasHost = true
+                        if let host = effectiveHost {
+                            forwardedRequest += "Host: \(host)\r\n"
+                        } else {
+                            forwardedRequest += "\(name): \(value)\r\n"
+                        }
+                        continue
+                    }
                     if excludedHeaders.contains(lowercasedName) {
                         continue
                     }
@@ -663,6 +752,10 @@ class ThinkingProxy {
                         continue
                     }
                     forwardedRequest += "\(name): \(value)\r\n"
+                }
+                
+                if effectiveHost != nil && !hasHost {
+                    forwardedRequest += "Host: \(effectiveHost!)\r\n"
                 }
                 
                 // Add/merge anthropic-beta header when thinking is enabled
@@ -683,8 +776,9 @@ class ThinkingProxy {
                     forwardedRequest += "anthropic-beta: \(existing)\r\n"
                 }
                 
-                // Override Host header
-                forwardedRequest += "Host: \(self.targetHost):\(self.targetPort)\r\n"
+                if effectiveHost == nil && !hasHost {
+                    forwardedRequest += "Host: \(self.targetHost):\(self.targetPort)\r\n"
+                }
                 // Always close connections - this proxy doesn't support keep-alive/pipelining
                 forwardedRequest += "Connection: close\r\n"
                 

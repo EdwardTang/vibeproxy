@@ -1,4 +1,4 @@
-.PHONY: build app install clean run help
+.PHONY: build app install clean run help smoke rapid lint-doctrine reset-runtime
 
 help: ## Show this help message
 	@echo "VibeProxy - macOS Menu Bar App"
@@ -29,7 +29,7 @@ install: app ## Build and install to /Applications
 
 run: app ## Build and run the app
 	@echo "🚀 Launching app..."
-	@open "VibeProxy.app"
+	@if [ -d "VibeProxy-dev.app" ]; then open "VibeProxy-dev.app"; else open "VibeProxy.app"; fi
 
 clean: ## Clean build artifacts
 	@echo "🧹 Cleaning..."
@@ -44,6 +44,25 @@ test: ## Run a quick test build
 	@echo "🧪 Testing build..."
 	@cd src && swift build
 	@echo "✅ Test build successful"
+
+smoke: ## Run local cursor-proxy smoke checks
+	@echo "🧪 Running cursor-proxy smoke test..."
+	@bash "./scripts/smoke-cursor-proxy.sh"
+
+rapid: app smoke ## Fast iterate loop: build app + smoke test
+	@echo "⚡ Rapid iteration cycle complete"
+
+reset-runtime: ## Kill stale app/proxy and clear smoke temp state
+	@bash "./scripts/reset-runtime.sh"
+
+lint-doctrine: ## Verify global AI lint doctrine files exist
+	@echo "🧭 Checking global AI lint doctrine..."
+	@[ -f "$$HOME/.cursor/.ai-lint/INDEX.md" ] || (echo "❌ Missing $$HOME/.cursor/.ai-lint/INDEX.md" && exit 1)
+	@[ -f "$$HOME/.cursor/.ai-lint/PHILOSOPHY.md" ] || (echo "❌ Missing $$HOME/.cursor/.ai-lint/PHILOSOPHY.md" && exit 1)
+	@[ -f "$$HOME/.cursor/.ai-lint/doctrine/languages/javascript.md" ] || (echo "❌ Missing javascript doctrine" && exit 1)
+	@[ -f "$$HOME/.cursor/.ai-lint/rejects/languages/javascript.md" ] || (echo "❌ Missing javascript rejects" && exit 1)
+	@[ -f "$$HOME/.cursor/.ai-lint/doctrine/languages/nodejs.md" ] || (echo "❌ Missing nodejs doctrine" && exit 1)
+	@echo "✅ Global AI lint doctrine files present"
 
 info: ## Show project information
 	@echo "Project: VibeProxy - macOS Menu Bar App"
